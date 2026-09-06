@@ -1,1053 +1,978 @@
-from __future__ import annotations
+"""
+Sistema pessoal de execução — habit tracker construído para reduzir a distância
+entre "eu deveria estar fazendo isso" e "comecei".
 
-import json
-import uuid
-from datetime import date, datetime, timedelta
-from pathlib import Path
+Princípios do sistema (ver habit_tracker_eu.txt / persona_eu.txt):
+- Menos tração -> menos informação na tela. A home é "Agora": uma prioridade.
+- Ativação, não organização: botão "Começar 5 minutos" como porta de entrada.
+- Modo Mustang: foco extremamente limpo, poucas decisões durante a execução.
+- Métrica central é Tração (composta), não streak. Streak pune o primeiro dia ruim.
+- Tempo para Engatar é rastreado como o gargalo real.
+- Accountability social > gamificação artificial.
+- Recuperação rápida: o sistema nunca lista atrasados, sempre pergunta "qual a
+  próxima ação", mesmo quando o dia saiu do planejado.
+"""
 
+import sqlite3
+from datetime import datetime, timedelta, date as date_cls
+
+import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
-# =========================================================
-# CONFIG
-# =========================================================
+DB_PATH = "tracao.db"
+FIVE_MIN_LABEL = "Começar 5 minutos"
 
-st.set_page_config(
-    page_title="MODO MUSTANG",
-    page_icon="🐎",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+# --------------------------------------------------------------------------
+# Banco de dados
+# --------------------------------------------------------------------------
 
-DATA_FILE = Path(__file__).with_name("mustang_data.json")
+@st.cache_resource
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# =========================================================
-# DATA LAYER
-# =========================================================
 
-DEFAULT_DATA = {
-    "tasks": [],
-    "plans": [],
-    "habits": [],
-    "sessions": [],
-    "settings": {
-        "theme": "dark",
-        "accountability_name": "",
-        "daily_target_minutes": 90,
-        "daily_target_tasks": 3,
-    },
+def init_db():
+    conn = get_conn()
+    with conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY, value TEXT
+            );
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT, description TEXT,
+                active INTEGER DEFAULT 1, created_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS priorities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT, title TEXT, project_id INTEGER,
+                obrigatorio INTEGER DEFAULT 1,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT, started_at TEXT, completed_at TEXT,
+                order_idx INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS commitments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT, title TEXT, done INTEGER DEFAULT 0, created_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS habits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT, active INTEGER DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS habit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                habit_id INTEGER, date TEXT, done INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                priority_id INTEGER, start_time TEXT, end_time TEXT,
+                duration_min REAL
+            );
+            CREATE TABLE IF NOT EXISTS ideas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT, created_at TEXT, reviewed INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS stuck_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                priority_id INTEGER, reason TEXT, created_at TEXT
+            );
+            """
+        )
+
+
+def q(sql, params=()):
+    conn = get_conn()
+    cur = conn.execute(sql, params)
+    return cur.fetchall()
+
+
+def run(sql, params=()):
+    conn = get_conn()
+    with conn:
+        cur = conn.execute(sql, params)
+    return cur.lastrowid
+
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def today_str():
+    return date_cls.today().isoformat()
+
+
+def get_setting(key, default=None):
+    row = q("SELECT value FROM settings WHERE key=?", (key,))
+    return row[0]["value"] if row else default
+
+
+def set_setting(key, value):
+    run(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
+# --------------------------------------------------------------------------
+# Tema / CSS — liquid glass, claro e escuro, persistido em settings
+# --------------------------------------------------------------------------
+
+def inject_theme():
+    theme = st.session_state.get("theme", "dark")
+
+    if theme == "dark":
+        bg = "#0c0f14"
+        bg_grad = "radial-gradient(circle at 15% 0%, #1a2230 0%, #0c0f14 55%), " \
+                  "radial-gradient(circle at 85% 100%, #14202b 0%, #0c0f14 60%)"
+        glass = "rgba(255,255,255,0.045)"
+        glass_border = "rgba(255,255,255,0.09)"
+        glass_strong = "rgba(255,255,255,0.07)"
+        text_primary = "#eef1f5"
+        text_secondary = "rgba(238,241,245,0.62)"
+        text_faint = "rgba(238,241,245,0.38)"
+        accent = "#8fb8ff"
+        accent_soft = "rgba(143,184,255,0.16)"
+        good = "#8fd8b0"
+        warn = "#f0c07a"
+        shadow = "0 20px 60px -25px rgba(0,0,0,0.65)"
+    else:
+        bg = "#f4f5f8"
+        bg_grad = "radial-gradient(circle at 15% 0%, #ffffff 0%, #eef0f5 55%), " \
+                   "radial-gradient(circle at 85% 100%, #fbfbfd 0%, #eef0f5 60%)"
+        glass = "rgba(255,255,255,0.55)"
+        glass_border = "rgba(20,25,35,0.08)"
+        glass_strong = "rgba(255,255,255,0.75)"
+        text_primary = "#191c22"
+        text_secondary = "rgba(25,28,34,0.62)"
+        text_faint = "rgba(25,28,34,0.40)"
+        accent = "#3b66d6"
+        accent_soft = "rgba(59,102,214,0.10)"
+        good = "#1f9d63"
+        warn = "#b5790f"
+        shadow = "0 20px 50px -25px rgba(30,40,60,0.22)"
+
+    st.markdown(
+        f"""
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+        html, body, [class*="css"] {{
+            font-family: 'Manrope', -apple-system, BlinkMacSystemFont, sans-serif;
+        }}
+
+        .stApp {{
+            background: {bg_grad};
+            background-color: {bg};
+            color: {text_primary};
+        }}
+
+        [data-testid="stSidebar"] {{
+            background: {glass};
+            border-right: 1px solid {glass_border};
+            backdrop-filter: blur(24px);
+        }}
+        [data-testid="stSidebar"] * {{ color: {text_primary}; }}
+
+        #MainMenu, footer, header {{ visibility: hidden; }}
+
+        h1, h2, h3 {{
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            color: {text_primary};
+        }}
+        p, span, label, .stMarkdown {{ color: {text_secondary}; }}
+
+        .glass-card {{
+            background: {glass};
+            border: 1px solid {glass_border};
+            border-radius: 22px;
+            padding: 28px 30px;
+            backdrop-filter: blur(20px) saturate(140%);
+            box-shadow: {shadow};
+            margin-bottom: 18px;
+            transition: transform 180ms ease, box-shadow 180ms ease;
+        }}
+        .glass-card.tight {{ padding: 16px 20px; }}
+
+        .eyebrow {{
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: {text_faint};
+            margin-bottom: 6px;
+        }}
+
+        .now-title {{
+            font-size: 1.85rem;
+            font-weight: 800;
+            color: {text_primary};
+            line-height: 1.25;
+            margin: 2px 0 4px 0;
+        }}
+        .now-meta {{
+            font-size: 0.85rem;
+            color: {text_faint};
+        }}
+
+        .badge {{
+            display: inline-block;
+            font-size: 0.7rem;
+            font-weight: 700;
+            letter-spacing: 0.03em;
+            padding: 3px 10px;
+            border-radius: 100px;
+            background: {accent_soft};
+            color: {accent};
+            margin-right: 6px;
+        }}
+        .badge.warn {{ background: rgba(240,192,122,0.16); color: {warn}; }}
+        .badge.good {{ background: rgba(143,216,176,0.16); color: {good}; }}
+
+        .metric-value {{
+            font-size: 2.1rem;
+            font-weight: 800;
+            color: {text_primary};
+            font-family: 'IBM Plex Mono', monospace;
+        }}
+        .metric-label {{
+            font-size: 0.75rem;
+            color: {text_faint};
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+        }}
+
+        .stButton>button {{
+            border-radius: 14px !important;
+            border: 1px solid {glass_border} !important;
+            background: {glass_strong} !important;
+            color: {text_primary} !important;
+            font-weight: 600 !important;
+            padding: 10px 18px !important;
+            backdrop-filter: blur(14px);
+            transition: transform 120ms ease, background 160ms ease;
+        }}
+        .stButton>button:hover {{
+            transform: translateY(-1px);
+            border-color: {accent} !important;
+        }}
+        .stButton>button:active {{ transform: translateY(0px) scale(0.985); }}
+
+        div[data-testid="stFormSubmitButton"] button,
+        .primary-cta button {{
+            background: linear-gradient(135deg, {accent}, {accent}) !important;
+            color: #0c0f14 !important;
+            border: none !important;
+            font-weight: 700 !important;
+        }}
+
+        [data-testid="stVerticalBlockBorderWrapper"] {{
+            border-radius: 18px !important;
+            border: 1px solid {glass_border} !important;
+            background: {glass} !important;
+            backdrop-filter: blur(16px);
+        }}
+
+        hr {{ border-color: {glass_border}; }}
+
+        .calm-empty {{
+            text-align: center;
+            padding: 46px 20px;
+            color: {text_faint};
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# --------------------------------------------------------------------------
+# Camada de dados / regras de negócio
+# --------------------------------------------------------------------------
+
+def list_projects(active_only=True):
+    sql = "SELECT * FROM projects" + (" WHERE active=1" if active_only else "")
+    return q(sql + " ORDER BY name")
+
+
+def create_project(name, description):
+    run(
+        "INSERT INTO projects (name, description, active, created_at) VALUES (?,?,1,?)",
+        (name, description, now_iso()),
+    )
+
+
+def add_priority(title, date_val, project_id, obrigatorio=True):
+    run(
+        """INSERT INTO priorities (date, title, project_id, obrigatorio, status, created_at, order_idx)
+           VALUES (?,?,?,?, 'pending', ?, (SELECT COALESCE(MAX(order_idx),0)+1 FROM priorities WHERE date=?))""",
+        (date_val, title, project_id, int(obrigatorio), now_iso(), date_val),
+    )
+
+
+def add_commitment(title, date_val):
+    run("INSERT INTO commitments (date, title, done, created_at) VALUES (?,?,0,?)",
+        (title, date_val, now_iso()))
+
+
+def get_open_session():
+    rows = q(
+        """SELECT s.*, p.title AS p_title, p.id AS p_id, p.obrigatorio, p.created_at AS p_created_at
+           FROM sessions s JOIN priorities p ON p.id = s.priority_id
+           WHERE s.end_time IS NULL ORDER BY s.id DESC LIMIT 1"""
+    )
+    return rows[0] if rows else None
+
+
+def get_agora_priority():
+    """Uma única prioridade. Prioriza obrigatórios pendentes mais antigos
+    (retomada calma de atrasos), depois opcionais de hoje. Nunca lista tudo."""
+    obrig = q(
+        """SELECT * FROM priorities WHERE obrigatorio=1 AND status IN ('pending','started')
+           ORDER BY date ASC, order_idx ASC, id ASC LIMIT 1"""
+    )
+    if obrig:
+        return obrig[0]
+    opc = q(
+        """SELECT * FROM priorities WHERE date=? AND status IN ('pending','started')
+           ORDER BY order_idx ASC, id ASC LIMIT 1""",
+        (today_str(),),
+    )
+    return opc[0] if opc else None
+
+
+def start_priority(priority_id):
+    run("UPDATE priorities SET status='started', started_at=? WHERE id=? AND started_at IS NULL",
+        (now_iso(), priority_id))
+    run("INSERT INTO sessions (priority_id, start_time) VALUES (?, ?)", (priority_id, now_iso()))
+
+
+def complete_open_session():
+    sess = get_open_session()
+    if not sess:
+        return
+    start = datetime.fromisoformat(sess["start_time"])
+    end = datetime.now()
+    duration = round((end - start).total_seconds() / 60, 1)
+    run("UPDATE sessions SET end_time=?, duration_min=? WHERE id=?",
+        (now_iso(), duration, sess["id"]))
+    run("UPDATE priorities SET status='done', completed_at=? WHERE id=?",
+        (now_iso(), sess["p_id"]))
+    return duration
+
+
+def abandon_open_session():
+    """Encerra a sessão sem culpa — a prioridade volta para pendente."""
+    sess = get_open_session()
+    if not sess:
+        return
+    start = datetime.fromisoformat(sess["start_time"])
+    duration = round((datetime.now() - start).total_seconds() / 60, 1)
+    run("UPDATE sessions SET end_time=?, duration_min=? WHERE id=?",
+        (now_iso(), duration, sess["id"]))
+    run("UPDATE priorities SET status='pending', started_at=NULL WHERE id=?", (sess["p_id"],))
+
+
+def log_stuck(priority_id, reason):
+    run("INSERT INTO stuck_events (priority_id, reason, created_at) VALUES (?,?,?)",
+        (priority_id, reason, now_iso()))
+
+
+STUCK_INTERVENTIONS = {
+    "Tédio": "Normal. Isso não pede motivação — pede 5 minutos. Volte para o cronômetro e comece só o próximo parágrafo/passo.",
+    "Falta de clareza": "Você não precisa saber o caminho todo. Escreva abaixo apenas a primeira ação concreta e visível (ex: 'abrir o slide 1').",
+    "Distração": "A interface foi reduzida de propósito. Feche as outras abas por 5 minutos — só isso, não precisa prometer mais que isso.",
+    "Pensando em outra coisa": "Guarde essa ideia no Estacionamento agora (não precisa lembrar) e volte para esta única linha.",
+    "Não sei por onde começar": "Escolha a menor ação possível que te deixaria com essa tarefa 1% mais perto de terminada. Só essa.",
 }
 
 
-def load_data() -> dict:
-    if not DATA_FILE.exists():
-        return json.loads(json.dumps(DEFAULT_DATA))
-    try:
-        with DATA_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        merged = json.loads(json.dumps(DEFAULT_DATA))
-        for key, value in data.items():
-            merged[key] = value
-        return merged
-    except (json.JSONDecodeError, OSError):
-        return json.loads(json.dumps(DEFAULT_DATA))
+def add_idea(text):
+    run("INSERT INTO ideas (text, created_at, reviewed) VALUES (?,?,0)", (text, now_iso()))
 
 
-def save_data(data: dict) -> None:
-    tmp = DATA_FILE.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    tmp.replace(DATA_FILE)
+def pending_ideas():
+    return q("SELECT * FROM ideas WHERE reviewed=0 ORDER BY id DESC")
 
 
-if "data" not in st.session_state:
-    st.session_state.data = load_data()
-
-DATA = st.session_state.data
-
-if "active_timer" not in st.session_state:
-    st.session_state.active_timer = None
-
-if "mustang_mode" not in st.session_state:
-    st.session_state.mustang_mode = False
-
-# =========================================================
-# HELPERS
-# =========================================================
+def mark_idea_reviewed(idea_id):
+    run("UPDATE ideas SET reviewed=1 WHERE id=?", (idea_id,))
 
 
-def uid() -> str:
-    return uuid.uuid4().hex[:10]
+# --------------------------------------------------------------------------
+# Métricas — Tração e Tempo para Engatar
+# --------------------------------------------------------------------------
 
+def compute_metrics(days=1):
+    end = date_cls.today()
+    start = end - timedelta(days=days - 1)
+    start_s, end_s = start.isoformat(), end.isoformat()
 
-def today_iso() -> str:
-    return date.today().isoformat()
-
-
-def parse_date(value: str) -> date:
-    return date.fromisoformat(value)
-
-
-def friendly_date(value: str) -> str:
-    d = parse_date(value)
-    return d.strftime("%d/%m/%Y")
-
-
-def priority_rank(priority: str) -> int:
-    return {"Alta": 0, "Média": 1, "Baixa": 2}.get(priority, 1)
-
-
-def current_plan_name(plan_id: str | None) -> str:
-    if not plan_id:
-        return "Sem cronograma"
-    plan = next((p for p in DATA["plans"] if p["id"] == plan_id), None)
-    return plan["name"] if plan else "Sem cronograma"
-
-
-def task_is_due(task: dict) -> bool:
-    return task.get("due_date") == today_iso()
-
-
-def today_tasks() -> list[dict]:
-    return [t for t in DATA["tasks"] if task_is_due(t)]
-
-
-def completed_today_tasks() -> list[dict]:
-    return [t for t in today_tasks() if t.get("completed")]
-
-
-def pending_today_tasks() -> list[dict]:
-    return [t for t in today_tasks() if not t.get("completed")]
-
-
-def total_focus_minutes_today() -> int:
-    total = 0
-    for session in DATA["sessions"]:
-        if session.get("date") == today_iso():
-            total += int(session.get("minutes", 0))
-    return total
-
-
-def weekly_focus_minutes() -> int:
-    start = date.today() - timedelta(days=6)
-    total = 0
-    for session in DATA["sessions"]:
-        try:
-            d = parse_date(session.get("date", ""))
-            if d >= start:
-                total += int(session.get("minutes", 0))
-        except ValueError:
-            pass
-    return total
-
-
-def habit_done_today(habit_id: str) -> bool:
-    today = today_iso()
-    for habit in DATA["habits"]:
-        if habit["id"] == habit_id:
-            return today in habit.get("completions", [])
-    return False
-
-
-def toggle_habit(habit_id: str) -> None:
-    today = today_iso()
-    for habit in DATA["habits"]:
-        if habit["id"] == habit_id:
-            completions = set(habit.get("completions", []))
-            if today in completions:
-                completions.remove(today)
-            else:
-                completions.add(today)
-            habit["completions"] = sorted(completions)
-            break
-    save_data(DATA)
-
-
-def next_priority_task() -> dict | None:
-    pending = pending_today_tasks()
-    if not pending:
-        # Bring forward overdue tasks only if the user has nothing today.
-        overdue = [
-            t
-            for t in DATA["tasks"]
-            if not t.get("completed")
-            and t.get("due_date")
-            and t.get("due_date") < today_iso()
-        ]
-        pending = overdue
-    if not pending:
-        return None
-    return sorted(
-        pending,
-        key=lambda t: (priority_rank(t.get("priority", "Média")), t.get("due_date", "9999-12-31"), t.get("created_at", "")),
-    )[0]
-
-
-def add_task(title: str, due_date: date, priority: str, duration: int, plan_id: str | None, category: str) -> None:
-    DATA["tasks"].append(
-        {
-            "id": uid(),
-            "title": title.strip(),
-            "due_date": due_date.isoformat(),
-            "priority": priority,
-            "duration": int(duration),
-            "plan_id": plan_id,
-            "category": category.strip() or "Geral",
-            "completed": False,
-            "completed_at": None,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-        }
+    priorities = q("SELECT * FROM priorities WHERE date BETWEEN ? AND ?", (start_s, end_s))
+    commitments = q("SELECT * FROM commitments WHERE date BETWEEN ? AND ?", (start_s, end_s))
+    sessions = q(
+        """SELECT s.* FROM sessions s JOIN priorities p ON p.id=s.priority_id
+           WHERE p.date BETWEEN ? AND ? AND s.end_time IS NOT NULL""",
+        (start_s, end_s),
     )
-    save_data(DATA)
 
+    n_priorities = len(priorities)
+    n_started = sum(1 for p in priorities if p["status"] in ("started", "done"))
+    n_done = sum(1 for p in priorities if p["status"] == "done")
+    n_commit = len(commitments)
+    n_commit_done = sum(1 for c in commitments if c["done"])
+    total_focus_min = sum((s["duration_min"] or 0) for s in sessions)
+    avg_focus_min = (total_focus_min / len(sessions)) if sessions else 0.0
 
-def complete_task(task_id: str) -> None:
-    for task in DATA["tasks"]:
-        if task["id"] == task_id:
-            task["completed"] = not task.get("completed", False)
-            task["completed_at"] = datetime.now().isoformat(timespec="seconds") if task["completed"] else None
-            break
-    save_data(DATA)
+    engage_times = []
+    for p in priorities:
+        if p["started_at"] and p["created_at"]:
+            delta = (datetime.fromisoformat(p["started_at"]) - datetime.fromisoformat(p["created_at"])).total_seconds() / 60
+            if delta >= 0:
+                engage_times.append(delta)
+    avg_engage_min = sum(engage_times) / len(engage_times) if engage_times else None
 
+    pct_commit = (n_commit_done / n_commit * 100) if n_commit else None
+    pct_started = (n_started / n_priorities * 100) if n_priorities else None
+    pct_done = (n_done / n_priorities * 100) if n_priorities else None
 
-def delete_task(task_id: str) -> None:
-    DATA["tasks"] = [t for t in DATA["tasks"] if t["id"] != task_id]
-    save_data(DATA)
-
-
-def stop_timer(save_session: bool = True) -> None:
-    timer = st.session_state.active_timer
-    if not timer:
-        return
-    try:
-        start = datetime.fromisoformat(timer["started_at"])
-        elapsed = max(1, int((datetime.now() - start).total_seconds() // 60))
-        elapsed = min(elapsed, 24 * 60)
-        if save_session:
-            DATA["sessions"].append(
-                {
-                    "id": uid(),
-                    "date": today_iso(),
-                    "task_id": timer.get("task_id"),
-                    "minutes": elapsed,
-                    "started_at": timer["started_at"],
-                    "finished_at": datetime.now().isoformat(timespec="seconds"),
-                    "kind": timer.get("kind", "focus"),
-                }
-            )
-            save_data(DATA)
-    except (TypeError, ValueError):
-        pass
-    st.session_state.active_timer = None
-
-
-# =========================================================
-# THEME / CSS
-# =========================================================
-
-THEME = DATA["settings"].get("theme", "dark")
-
-if "theme_select" not in st.session_state:
-    st.session_state.theme_select = THEME
-
-# Theme switch lives in the page header, but the CSS is controlled by the state.
-if st.session_state.theme_select != THEME:
-    DATA["settings"]["theme"] = st.session_state.theme_select
-    save_data(DATA)
-    THEME = st.session_state.theme_select
-
-if THEME == "dark":
-    bg = "#081019"
-    text = "#F5F7FA"
-    muted = "#98A2B3"
-    glass = "rgba(255,255,255,0.065)"
-    glass2 = "rgba(255,255,255,0.09)"
-    border = "rgba(255,255,255,0.13)"
-    shadow = "0 18px 60px rgba(0,0,0,0.28)"
-    accent = "#8B5CF6"
-    accent2 = "#22D3EE"
-    input_bg = "rgba(255,255,255,0.055)"
-    chip_bg = "rgba(255,255,255,0.08)"
-else:
-    bg = "#EEF2F7"
-    text = "#111827"
-    muted = "#667085"
-    glass = "rgba(255,255,255,0.64)"
-    glass2 = "rgba(255,255,255,0.82)"
-    border = "rgba(17,24,39,0.10)"
-    shadow = "0 18px 60px rgba(31,41,55,0.10)"
-    accent = "#6D28D9"
-    accent2 = "#0891B2"
-    input_bg = "rgba(255,255,255,0.72)"
-    chip_bg = "rgba(17,24,39,0.06)"
-
-st.markdown(
-    f"""
-    <style>
-    :root {{
-        --bg: {bg};
-        --text: {text};
-        --muted: {muted};
-        --glass: {glass};
-        --glass2: {glass2};
-        --border: {border};
-        --shadow: {shadow};
-        --accent: {accent};
-        --accent2: {accent2};
-        --input: {input_bg};
-        --chip: {chip_bg};
-    }}
-
-    .stApp {{
-        background:
-            radial-gradient(circle at 10% 0%, rgba(139,92,246,.14), transparent 32%),
-            radial-gradient(circle at 95% 5%, rgba(34,211,238,.11), transparent 28%),
-            var(--bg);
-        color: var(--text);
-    }}
-
-    [data-testid="stHeader"] {{
-        background: transparent;
-    }}
-
-    .main .block-container {{
-        max-width: 1240px;
-        padding-top: 2rem;
-        padding-bottom: 4rem;
-    }}
-
-    [data-testid="stToolbar"] {{
-        visibility: hidden;
-        height: 0;
-    }}
-
-    h1, h2, h3, h4, p, label, .stMarkdown {{
-        color: var(--text);
-    }}
-
-    .glass {{
-        background: linear-gradient(135deg, var(--glass2), var(--glass));
-        backdrop-filter: blur(24px) saturate(140%);
-        -webkit-backdrop-filter: blur(24px) saturate(140%);
-        border: 1px solid var(--border);
-        box-shadow: var(--shadow);
-        border-radius: 28px;
-    }}
-
-    .hero {{
-        padding: 28px 30px;
-        margin-bottom: 18px;
-    }}
-
-    .eyebrow {{
-        text-transform: uppercase;
-        letter-spacing: .13em;
-        font-size: .72rem;
-        font-weight: 800;
-        color: var(--muted);
-        margin-bottom: 7px;
-    }}
-
-    .hero-title {{
-        font-size: clamp(2rem, 4vw, 3.65rem);
-        line-height: .98;
-        font-weight: 900;
-        letter-spacing: -.045em;
-        margin: 0;
-    }}
-
-    .hero-sub {{
-        color: var(--muted);
-        font-size: 1rem;
-        max-width: 760px;
-        margin-top: 10px;
-        line-height: 1.5;
-    }}
-
-    .kpi {{
-        padding: 20px 22px;
-        min-height: 128px;
-    }}
-
-    .kpi-label {{
-        color: var(--muted);
-        font-size: .82rem;
-        margin-bottom: 10px;
-        font-weight: 700;
-    }}
-
-    .kpi-value {{
-        font-size: 2rem;
-        font-weight: 900;
-        letter-spacing: -.04em;
-    }}
-
-    .kpi-note {{
-        color: var(--muted);
-        font-size: .8rem;
-        margin-top: 4px;
-    }}
-
-    .section-title {{
-        font-size: 1.1rem;
-        font-weight: 850;
-        margin: 14px 0 10px;
-    }}
-
-    .next-card {{
-        padding: 30px;
-        text-align: center;
-    }}
-
-    .next-title {{
-        font-size: clamp(1.55rem, 3vw, 2.35rem);
-        line-height: 1.08;
-        font-weight: 900;
-        margin: 4px auto 8px;
-        max-width: 850px;
-        letter-spacing: -.035em;
-    }}
-
-    .next-meta {{
-        color: var(--muted);
-        margin-bottom: 20px;
-    }}
-
-    .chip {{
-        display: inline-flex;
-        align-items: center;
-        gap: 7px;
-        padding: 6px 10px;
-        border-radius: 999px;
-        background: var(--chip);
-        border: 1px solid var(--border);
-        font-size: .76rem;
-        font-weight: 800;
-        margin: 0 3px;
-    }}
-
-    .muted {{ color: var(--muted); }}
-
-    .task-row {{
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-        padding: 14px 16px;
-        margin: 8px 0;
-        border-radius: 18px;
-        background: var(--glass);
-        border: 1px solid var(--border);
-    }}
-
-    .task-main {{ flex: 1; min-width: 0; }}
-    .task-name {{ font-weight: 800; margin-bottom: 3px; }}
-    .task-meta {{ color: var(--muted); font-size: .78rem; }}
-
-    .empty {{
-        padding: 28px;
-        text-align: center;
-        color: var(--muted);
-    }}
-
-    .quote {{
-        padding: 22px 24px;
-        font-size: 1.05rem;
-        font-weight: 700;
-        line-height: 1.45;
-    }}
-
-    .mustang {{
-        background:
-            linear-gradient(135deg, rgba(139,92,246,.24), rgba(34,211,238,.12)),
-            var(--glass2);
-    }}
-
-    .timer {{
-        text-align: center;
-        font-variant-numeric: tabular-nums;
-        font-size: clamp(3rem, 9vw, 6rem);
-        font-weight: 900;
-        letter-spacing: -.06em;
-        margin: 12px 0;
-    }}
-
-    .small-note {{
-        color: var(--muted);
-        font-size: .78rem;
-        line-height: 1.45;
-    }}
-
-    div[data-testid="stMetric"] {{
-        background: var(--glass);
-        border: 1px solid var(--border);
-        padding: 15px;
-        border-radius: 20px;
-    }}
-
-    .stButton > button, .stDownloadButton > button {{
-        border-radius: 16px !important;
-        border: 1px solid var(--border) !important;
-        background: var(--glass2) !important;
-        color: var(--text) !important;
-        font-weight: 800 !important;
-        min-height: 2.7rem;
-        transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
-        box-shadow: none !important;
-    }}
-
-    .stButton > button:hover {{
-        transform: translateY(-1px);
-        border-color: rgba(139,92,246,.5) !important;
-    }}
-
-    .primary-btn button {{
-        background: linear-gradient(135deg, var(--accent), #7C3AED) !important;
-        color: white !important;
-        border: 0 !important;
-        box-shadow: 0 10px 28px rgba(109,40,217,.28) !important;
-    }}
-
-    .danger-btn button {{
-        background: rgba(239,68,68,.09) !important;
-        border-color: rgba(239,68,68,.26) !important;
-    }}
-
-    .stTextInput input, .stNumberInput input, .stTextArea textarea, .stDateInput input, .stSelectbox div[data-baseweb="select"] > div {{
-        background: var(--input) !important;
-        color: var(--text) !important;
-        border-radius: 14px !important;
-        border-color: var(--border) !important;
-    }}
-
-    .stCheckbox label, .stRadio label, .stSelectSlider label, .stToggle label {{
-        color: var(--text) !important;
-    }}
-
-    [data-testid="stTabs"] button {{
-        font-weight: 800;
-    }}
-
-    hr {{ border-color: var(--border) !important; }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# =========================================================
-# HEADER
-# =========================================================
-
-hcol1, hcol2 = st.columns([5, 1], vertical_alignment="center")
-with hcol1:
-    st.markdown(
-        f"""
-        <div class="glass hero">
-            <div class="eyebrow">Seu cockpit pessoal de execução</div>
-            <div class="hero-title">MODO MUSTANG 🐎</div>
-            <div class="hero-sub">
-                Menos coisas para olhar. Mais coisas realmente feitas.
-                O sistema foi desenhado para reduzir a fricção de começar e transformar pressão,
-                contexto e accountability em tração.
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with hcol2:
-    theme = st.toggle("Modo claro", value=(THEME == "light"), key="theme_toggle")
-    desired = "light" if theme else "dark"
-    if desired != THEME:
-        DATA["settings"]["theme"] = desired
-        save_data(DATA)
-        st.rerun()
-    st.session_state.mustang_mode = st.toggle("🐎 Modo Mustang", value=st.session_state.mustang_mode)
-
-# =========================================================
-# NAVIGATION
-# =========================================================
-
-page = st.radio(
-    "Navegação",
-    ["Hoje", "Cronogramas", "Hábitos", "Dashboard", "Accountability"],
-    horizontal=True,
-    label_visibility="collapsed",
-)
-
-# =========================================================
-# PAGE: HOJE
-# =========================================================
-
-if page == "Hoje":
-    today = today_tasks()
-    done = completed_today_tasks()
-    pending = pending_today_tasks()
-    focus_today = total_focus_minutes_today()
-    target_minutes = max(1, int(DATA["settings"].get("daily_target_minutes", 90)))
-    target_tasks = max(1, int(DATA["settings"].get("daily_target_tasks", 3)))
-    task_ratio = min(1.0, len(done) / target_tasks)
-    focus_ratio = min(1.0, focus_today / target_minutes)
-    traction = round(((task_ratio * 0.55) + (focus_ratio * 0.45)) * 100)
-
-    kc1, kc2, kc3, kc4 = st.columns(4)
-    kpis = [
-        ("Tração", f"{traction}%", "execução combinada hoje"),
-        ("Foco", f"{focus_today} min", f"meta {target_minutes} min"),
-        ("Entregas", f"{len(done)}/{target_tasks}", "compromissos concluídos"),
-        ("Pendências", f"{len(pending)}", "sem sobrecarregar a tela"),
-    ]
-    for col, (label, value, note) in zip([kc1, kc2, kc3, kc4], kpis):
-        with col:
-            st.markdown(
-                f"""
-                <div class="glass kpi">
-                    <div class="kpi-label">{label}</div>
-                    <div class="kpi-value">{value}</div>
-                    <div class="kpi-note">{note}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-    st.write("")
-
-    next_task = next_priority_task()
-
-    if st.session_state.active_timer:
-        timer = st.session_state.active_timer
-        task = next((t for t in DATA["tasks"] if t["id"] == timer.get("task_id")), None)
-        timer_title = task["title"] if task else "Sessão livre"
-        started_at = timer["started_at"]
-        st.markdown(f'<div class="glass mustang next-card">', unsafe_allow_html=True)
-        st.markdown('<div class="eyebrow">EM EXECUÇÃO</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="next-title">{timer_title}</div>', unsafe_allow_html=True)
-        st.markdown(
-            f'''<div class="timer" id="mustang-timer">00:00</div>
-            <div class="small-note">Começou em {started_at[11:16]} · não negocie com a tarefa durante a sessão.</div>
-            <script>
-                (() => {{
-                    const start = new Date("{started_at.replace("'", "")}");
-                    const el = document.getElementById("mustang-timer");
-                    const tick = () => {{
-                        const seconds = Math.max(0, Math.floor((new Date() - start) / 1000));
-                        const h = Math.floor(seconds / 3600);
-                        const m = Math.floor((seconds % 3600) / 60);
-                        const s = seconds % 60;
-                        el.textContent = (h > 0 ? String(h).padStart(2, '0') + ':' : '') + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
-                    }};
-                    tick(); setInterval(tick, 1000);
-                }})();
-            </script>''',
-            unsafe_allow_html=True,
-        )
-        b1, b2 = st.columns(2)
-        with b1:
-            st.markdown('<div class="primary-btn">', unsafe_allow_html=True)
-            if st.button("Concluir sessão", use_container_width=True):
-                stop_timer(save_session=True)
-                st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
-        with b2:
-            st.markdown('<div class="danger-btn">', unsafe_allow_html=True)
-            if st.button("Parar sem registrar", use_container_width=True):
-                stop_timer(save_session=False)
-                st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+    # Tração: composta, pondera início mais do que conclusão, foco, e
+    # compromissos cumpridos; tempo para engatar entra invertido (quanto
+    # menor, melhor) normalizado contra um teto de 60 minutos.
+    score_start = (pct_started or 0)
+    score_done = (pct_done or 0)
+    score_commit = (pct_commit if pct_commit is not None else 70)
+    score_focus = min(total_focus_min / 90 * 100, 100) if total_focus_min else 0
+    if avg_engage_min is not None:
+        score_engage = max(0, 100 - min(avg_engage_min, 60) / 60 * 100)
     else:
-        if next_task:
-            st.markdown(
-                f"""
-                <div class="glass next-card">
-                    <div class="eyebrow">AGORA</div>
-                    <div class="next-title">{next_task['title']}</div>
-                    <div class="next-meta">
-                        <span class="chip">{next_task.get('duration', 0)} min</span>
-                        <span class="chip">{next_task.get('priority', 'Média')}</span>
-                        <span class="chip">{next_task.get('category', 'Geral')}</span>
-                        <span class="chip">{current_plan_name(next_task.get('plan_id'))}</span>
-                    </div>
-                    <div class="small-note">A barreira de entrada é o problema. A sessão começa com 5 minutos.</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            q1, q2, q3 = st.columns([1.2, 1.2, 1])
-            with q1:
-                st.markdown('<div class="primary-btn">', unsafe_allow_html=True)
-                if st.button("🐎 Começar 5 minutos", use_container_width=True):
-                    st.session_state.active_timer = {
-                        "task_id": next_task["id"],
-                        "started_at": datetime.now().isoformat(timespec="seconds"),
-                        "kind": "5_min_start",
-                    }
-                    st.rerun()
-                st.markdown('</div>', unsafe_allow_html=True)
-            with q2:
-                if st.button("Começar sessão completa", use_container_width=True):
-                    st.session_state.active_timer = {
-                        "task_id": next_task["id"],
-                        "started_at": datetime.now().isoformat(timespec="seconds"),
-                        "kind": "focus",
-                    }
-                    st.rerun()
-            with q3:
-                if st.button("✅ Já fiz", use_container_width=True):
-                    complete_task(next_task["id"])
-                    st.rerun()
-        else:
-            st.markdown(
-                """
-                <div class="glass next-card">
-                    <div class="eyebrow">HOJE</div>
-                    <div class="next-title">Tudo que era obrigatório foi feito.</div>
-                    <div class="next-meta">Não invente pendências só porque a tela ficou vazia.</div>
-                    <div class="small-note">Você pode descansar, estudar por prazer ou preparar amanhã.</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+        score_engage = 60  # neutro quando não há dado suficiente
 
-    if not st.session_state.mustang_mode:
-        st.write("")
-        left, right = st.columns([1.35, 1])
-        with left:
-            st.markdown('<div class="section-title">Hoje</div>', unsafe_allow_html=True)
-            if not today:
-                st.markdown('<div class="glass empty">Nenhuma pendência para hoje. Isso também é um resultado.</div>', unsafe_allow_html=True)
-            else:
-                for task in sorted(today, key=lambda t: (t.get("completed", False), priority_rank(t.get("priority", "Média")))):
-                    status = "✅" if task.get("completed") else "○"
-                    plan = current_plan_name(task.get("plan_id"))
-                    c1, c2, c3 = st.columns([6, 1, 1])
-                    with c1:
-                        st.markdown(
-                            f"""
-                            <div class="task-row">
-                                <div class="task-main">
-                                    <div class="task-name">{status} {task['title']}</div>
-                                    <div class="task-meta">{task.get('duration', 0)} min · {task.get('category', 'Geral')} · {plan}</div>
-                                </div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-                    with c2:
-                        if st.button("↺" if task.get("completed") else "✓", key=f"done_{task['id']}"):
-                            complete_task(task["id"])
-                            st.rerun()
-                    with c3:
-                        if st.button("×", key=f"del_{task['id']}"):
-                            delete_task(task["id"])
-                            st.rerun()
-
-        with right:
-            st.markdown('<div class="section-title">Adicionar</div>', unsafe_allow_html=True)
-            with st.form("quick_add", clear_on_submit=True):
-                title = st.text_input("O que precisa ser feito?", placeholder="Ex.: Preventiva — aula 03")
-                c1, c2 = st.columns(2)
-                with c1:
-                    duration = st.number_input("Minutos", min_value=5, max_value=600, value=30, step=5)
-                    category = st.text_input("Categoria", value="Estudo")
-                with c2:
-                    priority = st.selectbox("Prioridade", ["Alta", "Média", "Baixa"], index=1)
-                    due = st.date_input("Dia", value=date.today())
-                plan_options = {"Sem cronograma": None}
-                plan_options.update({p["name"]: p["id"] for p in DATA["plans"]})
-                plan_name = st.selectbox("Cronograma", list(plan_options.keys()))
-                submitted = st.form_submit_button("Adicionar tarefa", use_container_width=True)
-                if submitted:
-                    if title.strip():
-                        add_task(title, due, priority, duration, plan_options[plan_name], category)
-                        st.rerun()
-                    else:
-                        st.warning("Dê um nome para a tarefa.")
-
-            st.markdown('<div class="section-title">Começar sem pensar</div>', unsafe_allow_html=True)
-            with st.form("quick_focus", clear_on_submit=False):
-                free_minutes = st.number_input("Sessão livre", min_value=5, max_value=240, value=25, step=5)
-                ok = st.form_submit_button("Iniciar foco livre", use_container_width=True)
-                if ok:
-                    st.session_state.active_timer = {
-                        "task_id": None,
-                        "started_at": datetime.now().isoformat(timespec="seconds"),
-                        "kind": f"free_{free_minutes}",
-                    }
-                    st.rerun()
-
-# =========================================================
-# PAGE: CRONOGRAMAS
-# =========================================================
-
-elif page == "Cronogramas":
-    st.markdown('<div class="section-title">Seus cronogramas</div>', unsafe_allow_html=True)
-    left, right = st.columns([1.25, 1])
-    with left:
-        if not DATA["plans"]:
-            st.markdown('<div class="glass empty">Crie seu primeiro cronograma. A ideia é transformar uma meta abstrata em ações datadas.</div>', unsafe_allow_html=True)
-        for plan in DATA["plans"]:
-            tasks = [t for t in DATA["tasks"] if t.get("plan_id") == plan["id"]]
-            completed = sum(1 for t in tasks if t.get("completed"))
-            percent = int((completed / len(tasks)) * 100) if tasks else 0
-            st.markdown(
-                f"""
-                <div class="glass" style="padding:20px 22px; margin-bottom:10px;">
-                    <div class="eyebrow">CRONOGRAMA</div>
-                    <h3 style="margin:0;">{plan['name']}</h3>
-                    <div class="small-note">{friendly_date(plan['start'])} → {friendly_date(plan['end'])}</div>
-                    <div style="margin-top:12px; height:8px; border-radius:99px; background:rgba(128,128,128,.16); overflow:hidden;">
-                        <div style="width:{percent}%; height:100%; border-radius:99px; background:linear-gradient(90deg, var(--accent), var(--accent2));"></div>
-                    </div>
-                    <div class="small-note" style="margin-top:7px;">{completed}/{len(tasks)} tarefas · {percent}%</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        st.markdown("---")
-        st.markdown('<div class="section-title">Sessões do cronograma</div>', unsafe_allow_html=True)
-        if DATA["plans"]:
-            selected_plan_name = st.selectbox("Escolha um cronograma", [p["name"] for p in DATA["plans"]])
-            selected_plan = next(p for p in DATA["plans"] if p["name"] == selected_plan_name)
-            plan_tasks = [t for t in DATA["tasks"] if t.get("plan_id") == selected_plan["id"]]
-            for task in sorted(plan_tasks, key=lambda x: x.get("due_date", "9999-12-31")):
-                icon = "✅" if task.get("completed") else "○"
-                st.markdown(
-                    f"<div class='task-row'><div class='task-main'><div class='task-name'>{icon} {task['title']}</div><div class='task-meta'>{friendly_date(task['due_date'])} · {task['duration']} min · {task['priority']}</div></div></div>",
-                    unsafe_allow_html=True,
-                )
-
-    with right:
-        st.markdown('<div class="section-title">Novo cronograma</div>', unsafe_allow_html=True)
-        with st.form("new_plan", clear_on_submit=True):
-            plan_name = st.text_input("Nome", placeholder="Preventiva — PSF")
-            c1, c2 = st.columns(2)
-            with c1:
-                start = st.date_input("Início", value=date.today())
-            with c2:
-                end = st.date_input("Fim", value=date.today() + timedelta(days=30))
-            objective = st.text_area("Objetivo", placeholder="Ex.: dominar o conteúdo do rodízio com microestudo diário")
-            submitted = st.form_submit_button("Criar cronograma", use_container_width=True)
-            if submitted:
-                if not plan_name.strip():
-                    st.warning("Dê um nome ao cronograma.")
-                elif end < start:
-                    st.warning("A data final não pode ser anterior à inicial.")
-                else:
-                    DATA["plans"].append({
-                        "id": uid(),
-                        "name": plan_name.strip(),
-                        "start": start.isoformat(),
-                        "end": end.isoformat(),
-                        "objective": objective.strip(),
-                    })
-                    save_data(DATA)
-                    st.rerun()
-
-        st.markdown('<div class="section-title">Adicionar sessão ao cronograma</div>', unsafe_allow_html=True)
-        if DATA["plans"]:
-            with st.form("new_plan_task", clear_on_submit=True):
-                selected_name = st.selectbox("Cronograma", [p["name"] for p in DATA["plans"]])
-                selected_plan = next(p for p in DATA["plans"] if p["name"] == selected_name)
-                title = st.text_input("Sessão", placeholder="Ex.: Aula — vigilância epidemiológica")
-                c1, c2 = st.columns(2)
-                with c1:
-                    due = st.date_input("Data", value=date.today())
-                    duration = st.number_input("Duração", min_value=5, max_value=600, value=30, step=5)
-                with c2:
-                    priority = st.selectbox("Prioridade", ["Alta", "Média", "Baixa"], index=1)
-                    category = st.text_input("Categoria", value="Estudo")
-                submitted = st.form_submit_button("Adicionar sessão", use_container_width=True)
-                if submitted:
-                    if title.strip():
-                        add_task(title, due, priority, duration, selected_plan["id"], category)
-                        st.rerun()
-                    else:
-                        st.warning("Nomeie a sessão.")
-        else:
-            st.info("Crie um cronograma primeiro.")
-
-# =========================================================
-# PAGE: HÁBITOS
-# =========================================================
-
-elif page == "Hábitos":
-    st.markdown('<div class="section-title">Hábitos que realmente importam</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="glass quote">Não estamos tentando acompanhar 17 hábitos. Estamos procurando comportamentos que sustentem sua vida real.</div>',
-        unsafe_allow_html=True,
+    tracao = round(
+        0.30 * score_start + 0.20 * score_done + 0.20 * score_commit
+        + 0.15 * score_focus + 0.15 * score_engage, 1
     )
-    left, right = st.columns([1.15, 1])
-    with left:
-        if not DATA["habits"]:
-            st.markdown('<div class="glass empty">Nenhum hábito cadastrado. Comece com poucos.</div>', unsafe_allow_html=True)
-        for habit in DATA["habits"]:
-            done_habit = habit_done_today(habit["id"])
-            c1, c2 = st.columns([7, 1])
-            with c1:
-                st.markdown(
-                    f"<div class='task-row'><div class='task-main'><div class='task-name'>{'✅' if done_habit else '○'} {habit['name']}</div><div class='task-meta'>{habit.get('why', '')}</div></div></div>",
-                    unsafe_allow_html=True,
-                )
-            with c2:
-                if st.button("✓" if not done_habit else "↺", key=f"habit_{habit['id']}"):
-                    toggle_habit(habit["id"])
-                    st.rerun()
-        st.markdown("---")
-        st.markdown('<div class="section-title">Regra para você</div>', unsafe_allow_html=True)
-        st.markdown(
-            f"""
-            <div class="glass quote">
-                Meta não é ser perfeito. Meta é manter o motor ligado.<br><br>
-                Hoje você marcou <b>{sum(1 for h in DATA['habits'] if habit_done_today(h['id']))}/{len(DATA['habits'])}</b> hábitos.
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with right:
-        with st.form("new_habit", clear_on_submit=True):
-            name = st.text_input("Novo hábito", placeholder="Ex.: 10 minutos de leitura")
-            why = st.text_input("Por que isso importa?", placeholder="Ex.: constância > intensidade")
-            submitted = st.form_submit_button("Adicionar hábito", use_container_width=True)
-            if submitted:
-                if name.strip():
-                    DATA["habits"].append({
-                        "id": uid(),
-                        "name": name.strip(),
-                        "why": why.strip(),
-                        "completions": [],
-                    })
-                    save_data(DATA)
-                    st.rerun()
-                else:
-                    st.warning("Dê um nome ao hábito.")
 
-# =========================================================
-# PAGE: DASHBOARD
-# =========================================================
+    return {
+        "n_priorities": n_priorities, "n_started": n_started, "n_done": n_done,
+        "n_commit": n_commit, "n_commit_done": n_commit_done,
+        "total_focus_min": round(total_focus_min, 1),
+        "avg_focus_min": round(avg_focus_min, 1),
+        "avg_engage_min": round(avg_engage_min, 1) if avg_engage_min is not None else None,
+        "pct_commit": pct_commit, "pct_started": pct_started, "pct_done": pct_done,
+        "tracao": tracao,
+    }
 
-elif page == "Dashboard":
-    st.markdown('<div class="section-title">Painel de tração</div>', unsafe_allow_html=True)
-    week_minutes = weekly_focus_minutes()
-    today_minutes = total_focus_minutes_today()
-    done_today = len(completed_today_tasks())
-    all_due = [t for t in DATA["tasks"] if t.get("due_date")]
-    done_all = sum(1 for t in all_due if t.get("completed"))
-    completion_rate = round((done_all / len(all_due)) * 100) if all_due else 0
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Foco hoje", f"{today_minutes} min")
-    c2.metric("Foco 7 dias", f"{week_minutes} min")
-    c3.metric("Tarefas concluídas hoje", done_today)
-    c4.metric("Conclusão geral", f"{completion_rate}%")
+def daily_series(days=14):
+    rows = []
+    for i in range(days - 1, -1, -1):
+        d = date_cls.today() - timedelta(days=i)
+        m = compute_metrics_for_single_day(d)
+        rows.append({"data": d.isoformat(), "tracao": m["tracao"],
+                     "tempo_engatar": m["avg_engage_min"], "foco_min": m["total_focus_min"]})
+    return pd.DataFrame(rows)
 
-    st.write("")
-    left, right = st.columns(2)
 
-    with left:
-        st.markdown('<div class="glass" style="padding:24px;"><div class="eyebrow">Tendência de foco</div>', unsafe_allow_html=True)
-        rows = []
-        for i in range(6, -1, -1):
-            d = date.today() - timedelta(days=i)
-            mins = sum(int(s.get("minutes", 0)) for s in DATA["sessions"] if s.get("date") == d.isoformat())
-            rows.append((d.strftime("%a"), mins))
-        max_m = max([m for _, m in rows] + [1])
-        for day_name, mins in rows:
-            pct = int((mins / max_m) * 100)
-            st.markdown(
-                f"<div style='display:flex;align-items:center;gap:10px;margin:9px 0;'><div style='width:38px;color:var(--muted);font-size:.78rem;'>{day_name}</div><div style='flex:1;height:10px;background:rgba(128,128,128,.15);border-radius:99px;overflow:hidden;'><div style='width:{pct}%;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:99px;'></div></div><div style='width:42px;text-align:right;font-weight:800;font-size:.8rem;'>{mins}m</div></div>",
-                unsafe_allow_html=True,
-            )
-        st.markdown('</div>', unsafe_allow_html=True)
+def compute_metrics_for_single_day(d: date_cls):
+    d_s = d.isoformat()
+    priorities = q("SELECT * FROM priorities WHERE date=?", (d_s,))
+    commitments = q("SELECT * FROM commitments WHERE date=?", (d_s,))
+    sessions = q(
+        """SELECT s.* FROM sessions s JOIN priorities p ON p.id=s.priority_id
+           WHERE p.date=? AND s.end_time IS NOT NULL""", (d_s,)
+    )
+    n_priorities = len(priorities)
+    n_started = sum(1 for p in priorities if p["status"] in ("started", "done"))
+    n_done = sum(1 for p in priorities if p["status"] == "done")
+    n_commit = len(commitments)
+    n_commit_done = sum(1 for c in commitments if c["done"])
+    total_focus_min = sum((s["duration_min"] or 0) for s in sessions)
 
-    with right:
-        st.markdown('<div class="glass" style="padding:24px;"><div class="eyebrow">Diagnóstico</div>', unsafe_allow_html=True)
-        avg_activation = None
-        # Approximation based on recorded session starts during the current day.
-        if DATA["sessions"]:
-            activation_samples = []
-            for s in DATA["sessions"]:
-                if s.get("date") == today_iso() and s.get("started_at"):
-                    activation_samples.append(1)
-            if activation_samples:
-                avg_activation = "registre mais sessões para estimar"
-        st.markdown(
-            f"""
-            <div class="task-row"><div class="task-main"><div class="task-name">A principal métrica</div><div class="task-meta">Tempo entre decidir e começar. O MVP registra sessões; a próxima versão pode medir o atraso explicitamente.</div></div></div>
-            <div class="task-row"><div class="task-main"><div class="task-name">Seu padrão</div><div class="task-meta">Pressão + ambiente + meta pequena → tração.</div></div></div>
-            <div class="task-row"><div class="task-main"><div class="task-name">Regra do sistema</div><div class="task-meta">Uma prioridade visível. O restante fica em segundo plano.</div></div></div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
+    engage_times = []
+    for p in priorities:
+        if p["started_at"] and p["created_at"]:
+            delta = (datetime.fromisoformat(p["started_at"]) - datetime.fromisoformat(p["created_at"])).total_seconds() / 60
+            if delta >= 0:
+                engage_times.append(delta)
+    avg_engage_min = sum(engage_times) / len(engage_times) if engage_times else None
 
-    st.write("")
-    st.markdown(
-        """
-        <div class="glass quote">
-            O dashboard não existe para mostrar uma vida perfeita. Ele existe para mostrar que você está em movimento.
-        </div>
+    pct_commit = (n_commit_done / n_commit * 100) if n_commit else None
+    pct_started = (n_started / n_priorities * 100) if n_priorities else None
+    pct_done = (n_done / n_priorities * 100) if n_priorities else None
+
+    score_start = (pct_started or 0)
+    score_done = (pct_done or 0)
+    score_commit = (pct_commit if pct_commit is not None else 70)
+    score_focus = min(total_focus_min / 90 * 100, 100) if total_focus_min else 0
+    score_engage = max(0, 100 - min(avg_engage_min, 60) / 60 * 100) if avg_engage_min is not None else 60
+
+    tracao = round(
+        0.30 * score_start + 0.20 * score_done + 0.20 * score_commit
+        + 0.15 * score_focus + 0.15 * score_engage, 1
+    )
+    return {"tracao": tracao, "avg_engage_min": round(avg_engage_min, 1) if avg_engage_min is not None else None,
+            "total_focus_min": round(total_focus_min, 1)}
+
+
+def build_daily_report(d: date_cls = None):
+    d = d or date_cls.today()
+    m = compute_metrics_for_single_day(d)
+    priorities = q("SELECT * FROM priorities WHERE date=?", (d.isoformat(),))
+    commitments = q("SELECT * FROM commitments WHERE date=?", (d.isoformat(),))
+    done = [p for p in priorities if p["status"] == "done"]
+    started_not_done = [p for p in priorities if p["status"] == "started"]
+    pending = [p for p in priorities if p["status"] == "pending"]
+
+    lines = [
+        f"Relatório do dia — {d.strftime('%d/%m/%Y')}",
+        "",
+        f"Tração: {m['tracao']}/100",
+        f"Tempo para engatar (médio): {m['avg_engage_min']} min" if m['avg_engage_min'] is not None else "Tempo para engatar: sem dados suficientes",
+        f"Tempo total em foco: {m['total_focus_min']} min",
+        "",
+        f"Prioridades planejadas: {len(priorities)} | concluídas: {len(done)} | iniciadas: {len(started_not_done)} | não iniciadas: {len(pending)}",
+    ]
+    if done:
+        lines.append("\nConcluídas:")
+        lines += [f"  ✓ {p['title']}" for p in done]
+    if pending:
+        lines.append("\nNão iniciadas (sem drama — seguem para retomada):")
+        lines += [f"  · {p['title']}" for p in pending]
+
+    if commitments:
+        n_done_c = sum(1 for c in commitments if c["done"])
+        lines.append(f"\nCompromissos: {n_done_c}/{len(commitments)} cumpridos")
+        for c in commitments:
+            mark = "✓" if c["done"] else "·"
+            lines.append(f"  {mark} {c['title']}")
+
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Componentes de UI
+# --------------------------------------------------------------------------
+
+def live_timer(start_time_iso, accent="#8fb8ff", text_color="#eef1f5"):
+    components.html(
+        f"""
+        <div id="timer" style="font-family:'IBM Plex Mono',monospace;font-size:3rem;
+             font-weight:700;color:{text_color};letter-spacing:0.02em;">00:00</div>
+        <script>
+        const start = new Date("{start_time_iso}").getTime();
+        function tick() {{
+            const now = new Date().getTime();
+            let diff = Math.max(0, Math.floor((now - start) / 1000));
+            const m = String(Math.floor(diff / 60)).padStart(2, '0');
+            const s = String(diff % 60).padStart(2, '0');
+            document.getElementById('timer').innerText = m + ":" + s;
+        }}
+        setInterval(tick, 1000);
+        tick();
+        </script>
         """,
-        unsafe_allow_html=True,
+        height=80,
     )
 
-# =========================================================
-# PAGE: ACCOUNTABILITY
-# =========================================================
 
-else:
-    st.markdown('<div class="section-title">Prestação de contas</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="glass quote">A cobrança que funciona para você é social. Este módulo prepara o resumo que você pode mandar para uma pessoa real.</div>',
-        unsafe_allow_html=True,
-    )
+def eyebrow(text):
+    st.markdown(f'<div class="eyebrow">{text}</div>', unsafe_allow_html=True)
 
-    left, right = st.columns([1, 1.2])
-    with left:
-        st.markdown('<div class="section-title">Configuração</div>', unsafe_allow_html=True)
-        with st.form("accountability_settings"):
-            name = st.text_input("Pessoa que recebe sua prestação", value=DATA["settings"].get("accountability_name", ""), placeholder="Ex.: meu amigo de estudos")
-            target_minutes = st.number_input("Meta diária de foco (min)", min_value=10, max_value=720, value=int(DATA["settings"].get("daily_target_minutes", 90)), step=10)
-            target_tasks = st.number_input("Meta diária de entregas", min_value=1, max_value=20, value=int(DATA["settings"].get("daily_target_tasks", 3)), step=1)
-            submitted = st.form_submit_button("Salvar", use_container_width=True)
-            if submitted:
-                DATA["settings"]["accountability_name"] = name.strip()
-                DATA["settings"]["daily_target_minutes"] = int(target_minutes)
-                DATA["settings"]["daily_target_tasks"] = int(target_tasks)
-                save_data(DATA)
+
+def glass_open(extra_class=""):
+    st.markdown(f'<div class="glass-card {extra_class}">', unsafe_allow_html=True)
+
+
+def glass_close():
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def sidebar_idea_capture():
+    with st.sidebar.expander("💡 Estacionar uma ideia", expanded=False):
+        txt = st.text_area("O que apareceu?", key="idea_quick", label_visibility="collapsed",
+                            placeholder="Guarde aqui e volte pro que importa agora.")
+        agora = get_agora_priority()
+        if st.button("Guardar ideia", key="save_idea_btn", use_container_width=True):
+            if txt.strip():
+                add_idea(txt.strip())
+                st.session_state.idea_quick = ""
+                if agora and agora["status"] in ("pending", "started"):
+                    st.toast("Ideia guardada. Sua prioridade continua sendo: " + agora["title"])
+                else:
+                    st.toast("Ideia guardada.")
                 st.rerun()
 
-    completed = completed_today_tasks()
-    report = "\n".join(
-        [
-            f"PRESTAÇÃO DE CONTAS — {date.today().strftime('%d/%m/%Y')}",
-            "",
-            f"Foco hoje: {total_focus_minutes_today()} min / {DATA['settings'].get('daily_target_minutes', 90)} min",
-            f"Entregas: {len(completed)}/{DATA['settings'].get('daily_target_tasks', 3)}",
-            "",
-            "Concluído:",
-            *(f"- {t['title']}" for t in completed),
-            "",
-            "Status: EM MOVIMENTO" if completed or total_focus_minutes_today() > 0 else "Status: PRECISO COMEÇAR",
-        ]
+
+# --------------------------------------------------------------------------
+# Páginas
+# --------------------------------------------------------------------------
+
+def page_agora():
+    open_sess = get_open_session()
+
+    if open_sess:
+        render_mustang_mode(open_sess)
+        return
+
+    agora = get_agora_priority()
+
+    if not agora:
+        glass_open()
+        st.markdown(
+            '<div class="calm-empty">'
+            '<div class="eyebrow">Agora</div>'
+            '<div class="now-title" style="font-size:1.3rem;">Nada pedindo sua atenção neste instante.</div>'
+            '<p>Adicione uma prioridade em "Hoje" quando quiser, ou aproveite a pausa.</p>'
+            '</div>', unsafe_allow_html=True
+        )
+        glass_close()
+        return
+
+    is_retomada = agora["date"] != today_str()
+    proj = None
+    if agora["project_id"]:
+        rows = q("SELECT name FROM projects WHERE id=?", (agora["project_id"],))
+        proj = rows[0]["name"] if rows else None
+
+    glass_open()
+    eyebrow("Retomando" if is_retomada else "Agora")
+    st.markdown(f'<div class="now-title">{agora["title"]}</div>', unsafe_allow_html=True)
+    badges = ""
+    if proj:
+        badges += f'<span class="badge">{proj}</span>'
+    badges += '<span class="badge warn">obrigatório</span>' if agora["obrigatorio"] else '<span class="badge">opcional</span>'
+    st.markdown(f'<div style="margin:10px 0 18px 0;">{badges}</div>', unsafe_allow_html=True)
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button(f"▶  {FIVE_MIN_LABEL}", use_container_width=True, type="primary"):
+            start_priority(agora["id"])
+            st.rerun()
+    with col2:
+        with st.popover("Não é essa agora"):
+            st.caption("Escolha outra prioridade obrigatória de hoje, se houver.")
+            outras = q(
+                "SELECT * FROM priorities WHERE date=? AND status='pending' AND id!=? ORDER BY order_idx",
+                (today_str(), agora["id"]),
+            )
+            if not outras:
+                st.write("Não há outra prioridade cadastrada para hoje.")
+            for o in outras:
+                if st.button(o["title"], key=f"swap_{o['id']}"):
+                    run("UPDATE priorities SET order_idx = order_idx - 1000 WHERE id=?", (o["id"],))
+                    st.rerun()
+    glass_close()
+
+    n_pending = q(
+        "SELECT COUNT(*) c FROM priorities WHERE status IN ('pending','started') AND date<=?",
+        (today_str(),),
+    )[0]["c"]
+    if n_pending > 1:
+        st.caption(f"Existem outras {n_pending - 1} prioridades esperando — elas aparecerão uma de cada vez.")
+
+
+def render_mustang_mode(sess):
+    st.markdown('<div class="eyebrow">Modo Mustang — foco</div>', unsafe_allow_html=True)
+    theme = st.session_state.get("theme", "dark")
+    accent = "#8fb8ff" if theme == "dark" else "#3b66d6"
+    text_color = "#eef1f5" if theme == "dark" else "#191c22"
+
+    glass_open()
+    st.markdown(f'<div class="now-title" style="font-size:1.5rem;">{sess["p_title"]}</div>', unsafe_allow_html=True)
+    live_timer(sess["start_time"], accent, text_color)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("✓ Concluir", use_container_width=True, type="primary"):
+            duration = complete_open_session()
+            st.session_state["last_completed_duration"] = duration
+            st.rerun()
+    with col2:
+        with st.popover("Estou travado"):
+            st.caption("Qual é o tipo de trava agora?")
+            reason = st.radio("motivo", list(STUCK_INTERVENTIONS.keys()),
+                               label_visibility="collapsed", key="stuck_reason")
+            if st.button("Registrar e ver o que fazer", key="stuck_confirm"):
+                log_stuck(sess["p_id"], reason)
+                st.session_state["stuck_message"] = STUCK_INTERVENTIONS[reason]
+    with col3:
+        if st.button("Encerrar sem concluir", use_container_width=True):
+            abandon_open_session()
+            st.rerun()
+
+    if st.session_state.get("stuck_message"):
+        st.info(st.session_state["stuck_message"])
+        if st.button("Ok, entendi"):
+            st.session_state["stuck_message"] = None
+            st.rerun()
+
+    glass_close()
+    st.caption("A interface está reduzida de propósito. Só isto importa agora.")
+
+
+def page_hoje():
+    st.markdown('<div class="eyebrow">Hoje</div>', unsafe_allow_html=True)
+    st.markdown('<h2 style="margin-top:-6px;">O que compõe o dia</h2>', unsafe_allow_html=True)
+
+    with st.expander("+ Adicionar prioridade ou compromisso"):
+        tab1, tab2 = st.tabs(["Prioridade", "Compromisso"])
+        with tab1:
+            with st.form("form_priority", clear_on_submit=True):
+                title = st.text_input("Título da prioridade")
+                projects = list_projects()
+                proj_opts = {"— sem projeto —": None} | {p["name"]: p["id"] for p in projects}
+                proj_choice = st.selectbox("Projeto (opcional)", list(proj_opts.keys()))
+                obrig = st.checkbox("Obrigatório", value=True)
+                if st.form_submit_button("Adicionar prioridade"):
+                    if title.strip():
+                        add_priority(title.strip(), today_str(), proj_opts[proj_choice], obrig)
+                        st.rerun()
+        with tab2:
+            with st.form("form_commit", clear_on_submit=True):
+                ctitle = st.text_input("Compromisso")
+                if st.form_submit_button("Adicionar compromisso"):
+                    if ctitle.strip():
+                        add_commitment(ctitle.strip(), today_str())
+                        st.rerun()
+
+    st.markdown("")
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        glass_open("tight")
+        st.markdown("**Prioridades de hoje**")
+        rows = q("SELECT * FROM priorities WHERE date=? ORDER BY obrigatorio DESC, order_idx",
+                  (today_str(),))
+        if not rows:
+            st.caption("Nenhuma prioridade cadastrada ainda.")
+        for r in rows:
+            icon = {"pending": "○", "started": "◐", "done": "●"}[r["status"]]
+            tag = "obrigatório" if r["obrigatorio"] else "opcional"
+            st.markdown(f"{icon} {r['title']}  ·  *{tag}*")
+        glass_close()
+
+    with col_b:
+        glass_open("tight")
+        st.markdown("**Compromissos de hoje**")
+        crows = q("SELECT * FROM commitments WHERE date=? ORDER BY id", (today_str(),))
+        if not crows:
+            st.caption("Nenhum compromisso cadastrado ainda.")
+        for c in crows:
+            checked = st.checkbox(c["title"], value=bool(c["done"]), key=f"commit_{c['id']}")
+            if checked != bool(c["done"]):
+                run("UPDATE commitments SET done=? WHERE id=?", (int(checked), c["id"]))
+                st.rerun()
+        glass_close()
+
+
+def page_semana():
+    st.markdown('<div class="eyebrow">Semana</div>', unsafe_allow_html=True)
+    st.markdown('<h2 style="margin-top:-6px;">O que está sendo construído</h2>', unsafe_allow_html=True)
+
+    today = date_cls.today()
+    monday = today - timedelta(days=today.weekday())
+    days = [monday + timedelta(days=i) for i in range(7)]
+
+    cols = st.columns(7)
+    for i, d in enumerate(days):
+        with cols[i]:
+            m = compute_metrics_for_single_day(d)
+            label = d.strftime("%a")[:3].capitalize()
+            is_today = d == today
+            glass_open("tight" + (" " if is_today else ""))
+            st.markdown(f"**{label}**  \n<span style='font-size:0.75rem;color:rgba(150,150,150,0.8)'>{d.strftime('%d/%m')}</span>",
+                        unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-value" style="font-size:1.4rem;">{m["tracao"]}</div>', unsafe_allow_html=True)
+            st.caption("tração")
+            glass_close()
+
+
+def page_projetos():
+    st.markdown('<div class="eyebrow">Projetos</div>', unsafe_allow_html=True)
+    st.markdown('<h2 style="margin-top:-6px;">Blocos de longo prazo</h2>', unsafe_allow_html=True)
+
+    with st.expander("+ Novo projeto"):
+        with st.form("form_project", clear_on_submit=True):
+            name = st.text_input("Nome do projeto (ex: Preventiva — PSF)")
+            desc = st.text_area("Descrição / conteúdos / período")
+            if st.form_submit_button("Criar projeto"):
+                if name.strip():
+                    create_project(name.strip(), desc.strip())
+                    st.rerun()
+
+    projects = list_projects()
+    if not projects:
+        st.caption("Nenhum projeto cadastrado ainda.")
+    for p in projects:
+        glass_open("tight")
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            st.markdown(f"**{p['name']}**")
+            if p["description"]:
+                st.caption(p["description"])
+            n_sessions = q(
+                "SELECT COUNT(*) c FROM priorities WHERE project_id=? AND status='done'", (p["id"],)
+            )[0]["c"]
+            st.caption(f"{n_sessions} sessões concluídas")
+        with c2:
+            if st.button("Gerar sessão para hoje", key=f"gen_{p['id']}"):
+                add_priority(f"Sessão — {p['name']}", today_str(), p["id"], obrigatorio=True)
+                st.rerun()
+        glass_close()
+
+
+def page_dados():
+    st.markdown('<div class="eyebrow">Dados</div>', unsafe_allow_html=True)
+    st.markdown('<h2 style="margin-top:-6px;">O espelho, não o fiscal</h2>', unsafe_allow_html=True)
+
+    period = st.radio("Período", ["7 dias", "14 dias", "30 dias"], horizontal=True, label_visibility="collapsed")
+    days = {"7 dias": 7, "14 dias": 14, "30 dias": 30}[period]
+    m = compute_metrics(days)
+
+    cols = st.columns(5)
+    metrics_display = [
+        ("Tração", f"{m['tracao']}", ""),
+        ("Tempo p/ engatar", f"{m['avg_engage_min']}" if m['avg_engage_min'] is not None else "—", "min"),
+        ("Foco médio/sessão", f"{m['avg_focus_min']}", "min"),
+        ("Compromissos", f"{m['pct_commit']:.0f}" if m['pct_commit'] is not None else "—", "%"),
+        ("Iniciadas", f"{m['pct_started']:.0f}" if m['pct_started'] is not None else "—", "%"),
+    ]
+    for c, (label, val, unit) in zip(cols, metrics_display):
+        with c:
+            glass_open("tight")
+            st.markdown(f'<div class="metric-value">{val}<span style="font-size:1rem;">{unit}</span></div>',
+                        unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-label">{label}</div>', unsafe_allow_html=True)
+            glass_close()
+
+    st.markdown("")
+    df = daily_series(days=days)
+    glass_open()
+    st.markdown("**Evolução da Tração**")
+    if df["tracao"].notna().any():
+        st.line_chart(df.set_index("data")["tracao"])
+    else:
+        st.caption("Ainda sem dados suficientes.")
+    glass_close()
+
+    glass_open()
+    st.markdown("**Tempo para Engatar — a métrica que importa**")
+    st.caption("Se essa linha estiver caindo, você está ficando melhor em começar — mesmo que o total de horas não mude muito.")
+    df_engage = df.dropna(subset=["tempo_engatar"])
+    if not df_engage.empty:
+        st.line_chart(df_engage.set_index("data")["tempo_engatar"])
+    else:
+        st.caption("Ainda sem dados suficientes — comece algumas prioridades para ver essa métrica nascer.")
+    glass_close()
+
+
+def page_ideias():
+    st.markdown('<div class="eyebrow">Estacionamento de Ideias</div>', unsafe_allow_html=True)
+    st.markdown('<h2 style="margin-top:-6px;">Curiosidade protegida, prioridade preservada</h2>', unsafe_allow_html=True)
+
+    with st.form("form_idea_page", clear_on_submit=True):
+        txt = st.text_area("Nova ideia")
+        if st.form_submit_button("Guardar"):
+            if txt.strip():
+                add_idea(txt.strip())
+                st.rerun()
+
+    ideas = pending_ideas()
+    if not ideas:
+        st.caption("Nada estacionado no momento.")
+    for i in ideas:
+        glass_open("tight")
+        c1, c2 = st.columns([4, 1])
+        with c1:
+            st.write(i["text"])
+            st.caption(datetime.fromisoformat(i["created_at"]).strftime("%d/%m %H:%M"))
+        with c2:
+            if st.button("Revisada", key=f"rev_{i['id']}"):
+                mark_idea_reviewed(i["id"])
+                st.rerun()
+        glass_close()
+
+
+def page_relatorio():
+    st.markdown('<div class="eyebrow">Relatório do dia</div>', unsafe_allow_html=True)
+    st.markdown('<h2 style="margin-top:-6px;">Accountability, não vigilância</h2>', unsafe_allow_html=True)
+
+    report = build_daily_report()
+    glass_open()
+    st.text_area("Copie e envie para quem cobra você", report, height=340)
+    st.download_button("Baixar relatório (.txt)", report, file_name=f"relatorio_{today_str()}.txt")
+    glass_close()
+
+
+def page_config():
+    st.markdown('<div class="eyebrow">Configurações</div>', unsafe_allow_html=True)
+
+    glass_open()
+    st.markdown("**Aparência**")
+    theme = st.radio("Tema", ["dark", "light"], horizontal=True,
+                      index=0 if st.session_state.get("theme", "dark") == "dark" else 1,
+                      format_func=lambda x: "Escuro" if x == "dark" else "Claro")
+    if theme != st.session_state.get("theme"):
+        st.session_state.theme = theme
+        set_setting("theme", theme)
+        st.rerun()
+    glass_close()
+
+    glass_open()
+    st.markdown("**Zona de risco**")
+    st.caption("Isso apaga todos os dados do sistema. Sem volta.")
+    confirm = st.checkbox("Confirmo que quero apagar tudo")
+    if st.button("Resetar todos os dados", disabled=not confirm):
+        conn = get_conn()
+        with conn:
+            for t in ["priorities", "commitments", "sessions", "ideas", "stuck_events", "habit_logs"]:
+                conn.execute(f"DELETE FROM {t}")
+        st.success("Dados apagados.")
+        st.rerun()
+    glass_close()
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def main():
+    st.set_page_config(page_title="Tração", page_icon="◐", layout="centered")
+    init_db()
+
+    if "theme" not in st.session_state:
+        st.session_state.theme = get_setting("theme", "dark")
+
+    inject_theme()
+
+    st.sidebar.markdown(
+        '<div style="padding:10px 4px 20px 4px;">'
+        '<div style="font-size:1.3rem;font-weight:800;">◐ Tração</div>'
+        '<div style="font-size:0.78rem;opacity:0.6;">sistema pessoal de execução</div>'
+        '</div>', unsafe_allow_html=True
     )
 
-    with right:
-        st.markdown('<div class="section-title">Mensagem do dia</div>', unsafe_allow_html=True)
-        st.code(report, language="text")
-        name = DATA["settings"].get("accountability_name", "")
-        if name:
-            st.markdown(
-                f"<div class='small-note'>Destinatário configurado: <b>{name}</b>. O envio continua deliberadamente humano — copie e mande para a pessoa.</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown('<div class="small-note">Configure uma pessoa real. O algoritmo não substitui accountability social.</div>', unsafe_allow_html=True)
+    pages = {
+        "Agora": page_agora,
+        "Hoje": page_hoje,
+        "Semana": page_semana,
+        "Projetos": page_projetos,
+        "Dados": page_dados,
+        "Estacionamento de Ideias": page_ideias,
+        "Relatório do dia": page_relatorio,
+        "Configurações": page_config,
+    }
+    choice = st.sidebar.radio("Navegação", list(pages.keys()), label_visibility="collapsed")
+    sidebar_idea_capture()
 
-# =========================================================
-# FOOTER
-# =========================================================
+    pages[choice]()
 
-st.write("")
-st.markdown(
-    f"<div class='small-note' style='text-align:center;'>MODO MUSTANG · {date.today().strftime('%d/%m/%Y')} · menos negociação, mais tração.</div>",
-    unsafe_allow_html=True,
-)
+
+if __name__ == "__main__":
+    main()
